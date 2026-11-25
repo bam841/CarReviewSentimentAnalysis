@@ -36,7 +36,7 @@ Tasks
 
     Create binary target: df_model["label"] = (df_model["rating"] >= 4).astype(int) (0 = Negative, 1 = Positive).
 
-    Strip leading/trailing whitespace on review_text ONLY (keep original casing, punctuation, and stopwords intact for RoBERTa/XLNet).
+    Strip leading/trailing whitespace on review_text ONLY (keep original casing, punctuation, and stopwords intact for RoBERTa/XLNet) and deduplicate exact review_text duplicates (df_model = df_model.drop_duplicates(subset=["review_text"]).copy()).
 
     Drop all columns except ["review_text", "label"].
 
@@ -58,7 +58,7 @@ Verification Gate (Must Pass Before Stopping)
 
     assert set(train_df["label"].unique()) == {0, 1}
 
-    assert len(set(train_df.index) & set(test_df.index)) == 0 (after verifying zero overlapping texts if unique).
+    assert len(set(train_df.index) & set(test_df.index)) == 0 and assert len(set(train_df["review_text"]) & set(test_df["review_text"])) == 0.
 
     assert class_weights.shape == (2,)
 
@@ -80,9 +80,9 @@ Tasks
 
     Implement extract_rule_features(text, lexicon):
 
-        Sums all positive word weights -> pos_weight_sum (≥0≥0).
+        Sums all positive word weights -> pos_weight_sum (>= 0).
 
-        Sums all negative word weights -> neg_weight_sum (≤0≤0).
+        Sums all negative word weights -> neg_weight_sum (<= 0).
 
         Computes net_score = pos_weight_sum + neg_weight_sum.
 
@@ -108,10 +108,10 @@ Verification Gate (Must Pass Before Stopping)
 
     Run sanity check on a review with 2 negative words and 1 positive word: confirm net_score < 0.
 
-Phase 3 — Shared Native PyTorch Training & Evaluation Engine
+Phase 3 — Shared Native PyTorch Training & Evaluation Engine (50-Epoch Capable)
 Objective
 
-Write one clean, reusable native PyTorch training/evaluation engine implementing the explicit forward pass, Cross-Entropy loss, backpropagation, gradient clipping, and AdamW update cycle.
+Write one clean, reusable native PyTorch training/evaluation engine implementing the explicit forward pass, Cross-Entropy loss, backpropagation, gradient clipping, AdamW update cycle, and 50-epoch warmup + cosine learning rate scheduling.
 Tasks
 
     Implement train_one_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device, use_amp=True):
@@ -144,11 +144,11 @@ Tasks
 
         Returns dict: {"loss", "acc", "macro_f1", "probs", "preds", "labels"}.
 
-    Implement run_two_stage_training(...) helper supporting:
+    Implement run_two_stage_training(...) helper supporting up to 50 total epochs:
 
-        Stage 1 (Head Warmup): Freeze backbone, train classification head (epochs=2, lr=1e-3).
+        Stage 1 (Head Warmup): Freeze backbone, train classification head (stage1_epochs=5, stage1_lr=5e-4, weight_decay=0.01).
 
-        Stage 2 (End-to-End Fine-Tuning): Unfreeze backbone, train (max_epochs=6, lr=2e-5, EarlyStopping patience=2 on val_loss), save best checkpoint (torch.save(model.state_dict(), save_path)), and reload best weights before returning history.
+        Stage 2 (End-to-End Fine-Tuning): Unfreeze backbone, train up to stage2_epochs=45 (50 epochs total, stage2_lr=1.5e-5 for XLNet / 2e-5 for Semantic RoBERTa, linear warmup 10% + cosine annealing decay, EarlyStopping patience=15), save best checkpoint (torch.save(model.state_dict(), save_path)), and reload best weights before returning history.
 
 DO NOT
 
@@ -160,14 +160,14 @@ Verification Gate (Must Pass Before Stopping)
 
     Run a 2-batch dummy tensor unit test (nn.Linear(8, 2)) through train_one_epoch and evaluate:
 
-        Assert loss is finite (not torch.isnan(loss)).
+        Assert loss is finite (not np.isnan(loss)).
 
-        Assert returned probs.shape == (N, 2) and torch.allclose(probs.sum(dim=-1), torch.ones(N), atol=1e-5).
+        Assert returned probs.shape == (N, 2) and np.allclose(probs.sum(axis=-1), np.ones(N), atol=1e-5).
 
-Phase 4 — Model 1: XLNet Baseline (xlnet-base-cased)
+Phase 4 — Model 1: XLNet Baseline (xlnet-base-cased, 50 Epochs)
 Objective
 
-Fine-tune XLNet as the baseline semantic benchmark using 2-stage fine-tuning and cache its validation/test Softmax probabilities.
+Fine-tune XLNet as the baseline semantic benchmark using 50-epoch 2-stage fine-tuning and cache its validation/test Softmax probabilities.
 Activation Function Contract (Model 1)
 
     Encoder Hidden Layers: Pre-trained GELU (config.ff_activation == "gelu"). DO NOT override.
@@ -184,7 +184,7 @@ Tasks
 
     Note on AMP stability: Use bfloat16 if torch.cuda.is_bf16_supported(), else set use_amp=False for XLNet if fp16 produces NaN gradients.
 
-    Run 2-stage fine-tuning (freeze model.transformer in Stage 1 for 2 epochs at lr=1e-3; unfreeze all in Stage 2 for up to 6 epochs at lr=2e-5, patience=2).
+    Run 50-epoch 2-stage fine-tuning (freeze model.transformer in Stage 1 for 5 epochs at lr=5e-4; unfreeze all in Stage 2 for up to 45 epochs at lr=1.5e-5 with linear warmup + cosine decay, patience=15).
 
     Save best checkpoint to checkpoints/best_xlnet.pt.
 
@@ -208,10 +208,10 @@ Verification Gate (Must Pass Before Stopping)
 
     Print XLNet Train/Val Loss history and Baseline test_df Accuracy + Macro F1.
 
-Phase 5 — Model 2: Rule-Based RoBERTa (RuleBasedRobertaClassifier)
+Phase 5 — Model 2: Rule-Based RoBERTa (RuleBasedRobertaClassifier, 50 Epochs)
 Objective
 
-Build a custom PyTorch nn.Module powered by roberta-base static word embeddings + HYBRID_LEXICON word weights without Transformer self-attention, so classification strictly reflects weighted word balance rather than sentence syntax.
+Build a custom PyTorch nn.Module powered by roberta-base static word embeddings + HYBRID_LEXICON word weights without Transformer self-attention, trained for up to 50 epochs, so classification strictly reflects weighted word balance rather than sentence syntax.
 Activation Function & Architecture Contract (Model 2)
 
     Embedding Backbone: Extract ONLY roberta.embeddings.word_embeddings (shape vocab_size x 768) from RobertaModel.from_pretrained("roberta-base").
@@ -220,9 +220,9 @@ Activation Function & Architecture Contract (Model 2)
 
     Lexicon-Weighted Token Pooling:
 
-        Map each review's tokens to their signed lexicon weights from HYBRID_LEXICON.
+        Map each review's BPE tokens (stripping leading "Ġ" and lowercasing) to their signed lexicon weights from HYBRID_LEXICON.
 
-        Compute weighted embedding pool over matched tokens (falling back to mean token embedding over non-padding tokens if zero lexicon words match) -> vector emb_pool of shape (B, 768).
+        Compute magnitude-normalized weighted embedding pool over matched tokens (falling back to mean token embedding over non-padding tokens if zero lexicon words match) -> vector emb_pool of shape (B, 768).
 
     Scalar Rule Vector Normalization — Tanh:
 
@@ -248,7 +248,7 @@ Tasks
 
     Implement RuleBasedRobertaClassifier(nn.Module) following the exact contract above.
 
-    Train using train_one_epoch + evaluate with torch.optim.AdamW(lr=1e-3, weight_decay=0.01) for up to 15 epochs with Early Stopping (patience=3 on val_loss).
+    Train using train_one_epoch + evaluate with torch.optim.AdamW(lr=5e-4, weight_decay=0.01) and CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6) for up to 50 epochs with Early Stopping (patience=15).
 
     Save best checkpoint to checkpoints/best_roberta_rule.pt.
 
@@ -272,10 +272,10 @@ Verification Gate (Must Pass Before Stopping)
 
     Assert test_res_rule["probs"].shape == (len(test_df), 2) and print test_df Accuracy + Macro F1.
 
-Phase 6 — Model 3: Semantic RoBERTa (roberta-base)
+Phase 6 — Model 3: Semantic RoBERTa (roberta-base, 50 Epochs)
 Objective
 
-Fine-tune the full 12-layer RobertaForSequenceClassification model so multi-head self-attention reads full phrase structure and resolves negation/context (e.g., "the car is not bad" -> Positive).
+Fine-tune the full 12-layer RobertaForSequenceClassification model for up to 50 epochs so multi-head self-attention reads full phrase structure and resolves negation/context (e.g., "the car is not bad" -> Positive).
 Activation Function Contract (Model 3)
 
     Encoder Hidden Layers: Pre-trained GELU (config.hidden_act == "gelu"). DO NOT override.
@@ -292,17 +292,17 @@ Tasks
 
     Instantiate RobertaForSequenceClassification.from_pretrained("roberta-base", num_labels=2) and move to DEVICE.
 
-    Run 2-stage fine-tuning:
+    Run 50-epoch 2-stage fine-tuning:
 
-        Stage 1 (Head Warmup): Freeze model.roberta, train model.classifier for 2 epochs at lr=1e-3.
+        Stage 1 (Head Warmup): Freeze model.roberta, train model.classifier for 5 epochs at lr=5e-4.
 
-        Stage 2 (Full Fine-Tuning): Unfreeze all parameters, train up to 6 epochs at lr=2e-5 with AdamW, AMP, and Early Stopping (patience=2 on val_loss).
+        Stage 2 (Full Fine-Tuning): Unfreeze all parameters, train up to 45 epochs (50 epochs total) at lr=2e-5 with AdamW, linear warmup + cosine annealing, AMP, and Early Stopping (patience=15).
 
     Save best checkpoint to checkpoints/best_roberta_semantic.pt.
 
     Reload best checkpoint and store val_res_sem and test_res_sem.
 
-    Plot side-by-side Train vs. Validation Loss and Validation Macro F1 curves for Models 1, 2, and 3 to audit overfitting.
+    Plot side-by-side Train vs. Validation Loss and Validation Macro F1 curves for Models 1, 2, and 3 across their 50-epoch runs to audit overfitting.
 
 DO NOT
 
@@ -365,13 +365,3 @@ Verification Gate (Final Sign-Off)
     assert np.allclose(P_ens_test.sum(axis=1), 1.0, atol=1e-5)
 
     Confirm all 4 models were evaluated on the exact same len(test_df) samples (assert np.array_equal(...) on labels).
-
-
----
-
-### How to Drive Your Coding Agent Without Hallucinations
-Save the block above as `agents.md` in your repo root, and feed your agent **one short prompt per turn**:
-* *"Read `agents.md` and execute **ONLY Phase 0**. Stop at the Verification Gate and show me the outputs."*
-* Once Phase 0 passes: *"Phase 0 verified. Execute **ONLY Phase 1** from `agents.md` and stop at the Verification Gate."*
-
-Whenever you want to execute **Phase 0** right here or add your professor's extra requirement into the spec first, just let me know.
